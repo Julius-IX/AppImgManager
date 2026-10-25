@@ -7,13 +7,17 @@ pub struct CliArgs {
   #[arg()]
   app_img_path: PathBuf,
 
+  /// Where to put the AppImage file
+  #[arg(long = "destination", short = 'd')]
+  destination_path: Option<PathBuf>,
+
+  /// Update existing stored AppImage file
+  #[arg(long = "update", short = 'u')]
+  update_img: PathBuf,
+
   /// If the given AppImage should be deleted from the filesystem
   #[arg(long = "clean", short = 'c', default_value = "false")]
   clean: bool,
-
-  /// Where to put the AppImage file
-  #[arg(long="destination", short='d')]
-  destination_path: Option<PathBuf>,
 
   /// If a hard link should be created in the Desktop folder
   #[arg(long = "link", short = 'l', default_value = "false")]
