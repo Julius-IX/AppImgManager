@@ -188,6 +188,48 @@ impl StoredApps {
     )
   }
 
+  /// All tracked apps, sorted by name
+  pub fn list(&self) -> Vec<Application> {
+    let mut list: Vec<Application> = self.apps.values().cloned().collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list
+  }
+
+  /// Create or remove the Desktop link of an already tracked app. The CLI can
+  /// only create it together with `add_app` / `update_app`.
+  pub fn set_linked_to_desktop(&mut self, name: &str, linked: bool) -> Result<(), std::io::Error> {
+    let old = self
+      .apps
+      .get(name)
+      .cloned()
+      .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no tracked app with that name"))?;
+    if old.linked_to_desktop == linked {
+      return Ok(());
+    }
+    let mut app = old.clone();
+    app.linked_to_desktop = linked;
+
+    let mut rollback = Rollback::default();
+    if linked {
+      link_on_desktop(&app, &mut rollback)?;
+    } else {
+      let link = get_desktop_dir().join(&app.name);
+      if let Err(e) = remove_file(&link)
+        && e.kind() != io::ErrorKind::NotFound
+      {
+        return ctx(Err(e), format!("removing {}", link.display()));
+      }
+    }
+
+    self.apps.insert(name.to_string(), app);
+    if let Err(e) = self.save() {
+      self.apps.insert(name.to_string(), old);
+      return Err(e); // `rollback` drops here and removes a link just created
+    }
+    rollback.commit();
+    Ok(())
+  }
+
   /// True if an app is tracked at this path
   pub fn is_tracked(&self, path: &Path) -> bool {
     self.find_name(path).is_some()
