@@ -332,11 +332,13 @@ impl StoredApps {
     Ok((app, rollback))
   }
 
-  /// Extracts the AppImage's .desktop file into the applications dir. Refuses
-  /// if an app with that entry name is already tracked.
+  /// Puts the AppImage's .desktop file into the applications dir, generating
+  /// a minimal one if it ships none. Refuses if an app with that entry name is
+  /// already tracked.
   fn extract_entry(&self, new_img: &Path, rollback: &mut Rollback) -> io::Result<PathBuf> {
+    let apps_dir = get_applications_dir();
     let mut conflict: Option<String> = None;
-    let extracted = extract_desktop_file(new_img, &get_applications_dir(), &mut |target| {
+    let mut before_write = |target: &Path| -> io::Result<()> {
       let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
       if let Some(other) = self.apps.get(name) {
         conflict = Some(if same_path(&other.path, new_img) {
@@ -350,13 +352,29 @@ impl StoredApps {
         return Err(io::Error::other("entry name already tracked"));
       }
       rollback.track_file(target)
-    });
-    match (extracted, conflict) {
-      (_, Some(msg)) => Err(io::Error::new(io::ErrorKind::AlreadyExists, msg)),
-      (r, None) => ctx(
-        r,
+    };
+
+    let result = match extract_desktop_file(new_img, &apps_dir, &mut before_write) {
+      Ok(Some(path)) => Ok(path),
+      Ok(None) => {
+        eprintln!(
+          "note: {} has no .desktop file, generating one",
+          new_img.display()
+        );
+        ctx(
+          DesktopEntry::for_appimage(new_img)
+            .and_then(|entry| entry.write_to(&apps_dir, &mut before_write)),
+          format!("generating .desktop file for {}", new_img.display()),
+        )
+      }
+      Err(e) => ctx(
+        Err(e),
         format!("extracting .desktop file from {}", new_img.display()),
       ),
+    };
+    match (result, conflict) {
+      (_, Some(msg)) => Err(io::Error::new(io::ErrorKind::AlreadyExists, msg)),
+      (r, None) => r,
     }
   }
 

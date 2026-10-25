@@ -294,8 +294,9 @@ pub fn make_executable(path: &Path) -> io::Result<()> {
   Ok(())
 }
 
-/// Extracts files matching `pattern` into `work/squashfs-root`
-fn extract(appimage: &Path, work: &Path, pattern: &str) -> io::Result<()> {
+/// Extracts files matching `pattern` into `work/squashfs-root`. `Ok(false)`
+/// means the AppImage ran but extracting the pattern failed (usually: no match).
+fn extract(appimage: &Path, work: &Path, pattern: &str) -> io::Result<bool> {
   let appimage = ctx(
     appimage.canonicalize(),
     format!("resolving {}", appimage.display()),
@@ -310,17 +311,7 @@ fn extract(appimage: &Path, work: &Path, pattern: &str) -> io::Result<()> {
       .status(),
     format!("running {} --appimage-extract", appimage.display()),
   )?;
-  if status.success() {
-    Ok(())
-  } else {
-    Err(io::Error::new(
-      io::ErrorKind::NotFound,
-      format!(
-        "{} --appimage-extract {pattern} failed ({status})",
-        appimage.display()
-      ),
-    ))
-  }
+  Ok(status.success())
 }
 
 /// First regular file (symlinks followed) in `dir` whose name satisfies `pick`
@@ -338,23 +329,37 @@ pub type BeforeWrite<'a> = &'a mut dyn FnMut(&Path) -> io::Result<()>;
 
 /// Copies contents (not permissions) into `dest/name`, so the result is always writable
 fn copy_out(src: &Path, dest: &Path, name: &str, before_write: BeforeWrite) -> io::Result<PathBuf> {
+  let bytes = ctx(fs::read(src), format!("reading {}", src.display()))?;
+  write_out(&bytes, dest, name, before_write)
+}
+
+/// Writes `bytes` to `dest/name`, creating `dest` if needed
+fn write_out(
+  bytes: &[u8],
+  dest: &Path,
+  name: &str,
+  before_write: BeforeWrite,
+) -> io::Result<PathBuf> {
   ctx(
     ensure_dir(dest),
     format!("creating directory {}", dest.display()),
   )?;
   let out = dest.join(name);
-  let bytes = ctx(fs::read(src), format!("reading {}", src.display()))?;
   before_write(&out)?;
   ctx(fs::write(&out, bytes), format!("writing {}", out.display()))?;
   Ok(out)
 }
 
 /// Extracts the root `.desktop` file to a temp dir. Returns it with its
-/// normalized name (the name it is stored under).
-fn extract_desktop_to(appimage: &Path, tmp: &TempDir) -> io::Result<(PathBuf, String)> {
-  extract(appimage, &tmp.path, "*.desktop")?;
-  let src = find_in(&tmp.path.join("squashfs-root"), |n| n.ends_with(".desktop"))
-    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no .desktop file"))?;
+/// normalized name (the name it is stored under), or `None` if the AppImage
+/// doesn't ship one.
+fn extract_desktop_to(appimage: &Path, tmp: &TempDir) -> io::Result<Option<(PathBuf, String)>> {
+  if !extract(appimage, &tmp.path, "*.desktop")? {
+    return Ok(None);
+  }
+  let Some(src) = find_in(&tmp.path.join("squashfs-root"), |n| n.ends_with(".desktop")) else {
+    return Ok(None);
+  };
   let name = src
     .file_name()
     .and_then(|n| n.to_str())
@@ -365,26 +370,33 @@ fn extract_desktop_to(appimage: &Path, tmp: &TempDir) -> io::Result<(PathBuf, St
         ".desktop file has no valid name",
       )
     })?;
-  Ok((src, name))
+  Ok(Some((src, name)))
 }
 
 /// The name an AppImage's desktop entry would be stored under, without
-/// installing anything
+/// installing anything. AppImages without a .desktop file get the name a
+/// generated entry would have.
 pub fn desktop_entry_name(appimage: &Path) -> io::Result<String> {
   let tmp = TempDir::new()?;
-  extract_desktop_to(appimage, &tmp).map(|(_, name)| name)
+  match extract_desktop_to(appimage, &tmp)? {
+    Some((_, name)) => Ok(name),
+    None => DesktopEntry::for_appimage(appimage).map(|e| e.file_name()),
+  }
 }
 
 /// Extracts the root `.desktop` file into `dest` under its normalized name.
-/// Returns its new path.
+/// Returns its new path, or `None` if the AppImage doesn't ship one (the
+/// caller can fall back to `DesktopEntry`).
 pub fn extract_desktop_file(
   appimage: &Path,
   dest: &Path,
   before_write: BeforeWrite,
-) -> io::Result<PathBuf> {
+) -> io::Result<Option<PathBuf>> {
   let tmp = TempDir::new()?;
-  let (src, name) = extract_desktop_to(appimage, &tmp)?;
-  copy_out(&src, dest, &name, before_write)
+  match extract_desktop_to(appimage, &tmp)? {
+    Some((src, name)) => copy_out(&src, dest, &name, before_write).map(Some),
+    None => Ok(None),
+  }
 }
 
 /// Extracts the icon (png, svg, xpm, or .DirIcon) into `dest` as `<stem>.<ext>`.
@@ -399,7 +411,7 @@ pub fn extract_icon(
   let tmp = TempDir::new()?;
   let root = tmp.path.join("squashfs-root");
   for pattern in ["*.png", "*.svg", "*.xpm", ".DirIcon"] {
-    if extract(appimage, &tmp.path, pattern).is_ok() {
+    if matches!(extract(appimage, &tmp.path, pattern), Ok(true)) {
       let hit = find_in(&root, |n| {
         n == ".DirIcon" || [".png", ".svg", ".xpm"].iter().any(|e| n.ends_with(e))
       });
@@ -456,6 +468,87 @@ pub fn install_icon(
   before_write(&out)?;
   ctx(fs::write(&out, bytes), format!("writing {}", out.display()))?;
   Ok(out)
+}
+
+/// A minimal `.desktop` entry, for AppImages that don't ship their own
+pub struct DesktopEntry {
+  /// Display name
+  pub name: String,
+  /// The AppImage to launch
+  pub exec: PathBuf,
+  pub icon: Option<PathBuf>,
+  pub categories: Vec<String>,
+  pub terminal: bool,
+  /// Name the entry is stored under, including `.desktop`
+  file_name: String,
+}
+
+impl DesktopEntry {
+  /// Builds an entry from the AppImage's file name: `Foo-1.2-x86_64.AppImage`
+  /// becomes the entry `Foo.desktop` named "Foo".
+  pub fn for_appimage(appimage: &Path) -> io::Result<Self> {
+    let exec = ctx(
+      appimage.canonicalize(),
+      format!("resolving {}", appimage.display()),
+    )?;
+    let file = exec
+      .file_name()
+      .and_then(|n| n.to_str())
+      .map(normalize_file_name)
+      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path has no valid file name"))?;
+    let stem = match file.len().checked_sub(".appimage".len()) {
+      Some(i) if file.is_char_boundary(i) && file[i..].eq_ignore_ascii_case(".appimage") => {
+        &file[..i]
+      }
+      _ => file.as_str(),
+    };
+    if stem.is_empty() {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "can't derive an entry name from the file name",
+      ));
+    }
+    Ok(Self {
+      name: stem.to_string(),
+      exec,
+      icon: None,
+      categories: vec!["Utility".into()],
+      terminal: false,
+      file_name: format!("{stem}.desktop"),
+    })
+  }
+
+  /// The name the entry is stored under, e.g. `Foo.desktop`
+  pub fn file_name(&self) -> String {
+    self.file_name.clone()
+  }
+
+  /// The file's content
+  pub fn render(&self) -> String {
+    // Newlines would end the value early, backslash is the escape character
+    let name = self.name.replace('\\', "\\\\").replace(['\n', '\r'], " ");
+    let mut out = String::from("[Desktop Entry]\nType=Application\n");
+    out.push_str(&format!("Name={name}\n"));
+    out.push_str(&format!("Exec={}\n", exec_program(&self.exec)));
+    if let Some(icon) = &self.icon {
+      out.push_str(&format!("Icon={}\n", icon.to_string_lossy()));
+    }
+    out.push_str(&format!("Terminal={}\n", self.terminal));
+    if !self.categories.is_empty() {
+      out.push_str(&format!("Categories={};\n", self.categories.join(";")));
+    }
+    out
+  }
+
+  /// Writes the entry into `dest` under its file name. Returns its path.
+  pub fn write_to(&self, dest: &Path, before_write: BeforeWrite) -> io::Result<PathBuf> {
+    write_out(
+      self.render().as_bytes(),
+      dest,
+      &self.file_name,
+      before_write,
+    )
+  }
 }
 
 /// Rewrites a desktop file line by line. `edit` gets (is_in_main_group, line
@@ -531,15 +624,21 @@ pub fn set_icon(desktop_file: &Path, icon: &Path) -> io::Result<()> {
   fs::write(desktop_file, out)
 }
 
-/// Points every `Exec=` line (including [Desktop Action] groups) at `exec`,
-/// keeping the original arguments (`%U`, flags, etc.). Idempotent.
-pub fn set_exec(desktop_file: &Path, exec: &Path) -> io::Result<()> {
+/// A program path as it must appear in an `Exec=` line: `%` doubled, and
+/// quoted if it contains spaces
+fn exec_program(exec: &Path) -> String {
   let s = exec.to_string_lossy().replace('%', "%%");
-  let program = if s.contains(' ') {
+  if s.contains(' ') {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
   } else {
     s
-  };
+  }
+}
+
+/// Points every `Exec=` line (including [Desktop Action] groups) at `exec`,
+/// keeping the original arguments (`%U`, flags, etc.). Idempotent.
+pub fn set_exec(desktop_file: &Path, exec: &Path) -> io::Result<()> {
+  let program = exec_program(exec);
 
   rewrite(desktop_file, |_, line| {
     let value = line.strip_prefix("Exec=")?;
@@ -621,5 +720,41 @@ mod tests {
     assert_eq!(n("foo-1.0.appimage"), "foo.appimage");
     assert_eq!(n("foo-1.2.3.desktop"), "foo.desktop");
     assert_eq!(n("foo-1.2.3"), "foo");
+  }
+
+  #[test]
+  fn generated_entry() {
+    use super::DesktopEntry;
+    use std::path::PathBuf;
+    let entry = DesktopEntry {
+      name: "My App".into(),
+      exec: PathBuf::from("/home/u/Applications/My App.AppImage"),
+      icon: Some(PathBuf::from("/home/u/.local/share/icons/My App.png")),
+      categories: vec!["Utility".into(), "Network".into()],
+      terminal: false,
+      file_name: "My App.desktop".into(),
+    };
+    assert_eq!(
+      entry.render(),
+      "[Desktop Entry]\nType=Application\nName=My App\n\
+       Exec=\"/home/u/Applications/My App.AppImage\"\n\
+       Icon=/home/u/.local/share/icons/My App.png\nTerminal=false\n\
+       Categories=Utility;Network;\n"
+    );
+  }
+
+  #[test]
+  fn generated_entry_name_comes_from_file_name() {
+    use super::DesktopEntry;
+    let dir = super::TempDir::new().unwrap();
+    let img = dir.path.join("Foo-1.2.3-x86_64.AppImage");
+    std::fs::write(&img, b"").unwrap();
+    let entry = DesktopEntry::for_appimage(&img).unwrap();
+    assert_eq!(entry.name, "Foo");
+    assert_eq!(entry.file_name(), "Foo.desktop");
+    let out = entry
+      .write_to(&dir.path.join("apps"), &mut |_| Ok(()))
+      .unwrap();
+    assert!(std::fs::read_to_string(out).unwrap().contains("Name=Foo\n"));
   }
 }
