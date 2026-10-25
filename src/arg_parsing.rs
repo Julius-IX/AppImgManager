@@ -1,8 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
-pub const DEFAULT_DESTINATION: &str = "~/Applications/";
-
 #[derive(Parser)]
 #[command(author, version, about = "A tool to manage AppImages")]
 struct ArgParser {

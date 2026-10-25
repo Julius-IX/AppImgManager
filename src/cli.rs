@@ -1,6 +1,5 @@
 use clap::Args;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Args)]
 pub struct CliArgs {
@@ -13,7 +12,7 @@ pub struct CliArgs {
   clean: bool,
 
   /// Where to put the AppImage file
-  #[arg(long="destination", short='d', default_value=super::arg_parsing::DEFAULT_DESTINATION)]
+  #[arg(long="destination", short='d')]
   destination_path: Option<PathBuf>,
 
   /// If a hard link should be created in the Desktop folder
