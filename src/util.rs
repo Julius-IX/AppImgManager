@@ -183,7 +183,10 @@ fn normalize_stem(stem: &str) -> String {
       .all(|p| PLATFORM_WORDS.contains(&p.to_ascii_lowercase().as_str()))
     {
       kind[i] = Kind::Soft;
-      prev_x86 = tok.rsplit('.').next().is_some_and(|p| p.eq_ignore_ascii_case("x86"));
+      prev_x86 = tok
+        .rsplit('.')
+        .next()
+        .is_some_and(|p| p.eq_ignore_ascii_case("x86"));
     } else if after_version
       && (tok.chars().all(|c| c.is_ascii_digit()) || is_hash(tok) || is_prerelease_like(tok, &[]))
     {
@@ -346,6 +349,32 @@ fn copy_out(src: &Path, dest: &Path, name: &str, before_write: BeforeWrite) -> i
   Ok(out)
 }
 
+/// Extracts the root `.desktop` file to a temp dir. Returns it with its
+/// normalized name (the name it is stored under).
+fn extract_desktop_to(appimage: &Path, tmp: &TempDir) -> io::Result<(PathBuf, String)> {
+  extract(appimage, &tmp.path, "*.desktop")?;
+  let src = find_in(&tmp.path.join("squashfs-root"), |n| n.ends_with(".desktop"))
+    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no .desktop file"))?;
+  let name = src
+    .file_name()
+    .and_then(|n| n.to_str())
+    .map(normalize_file_name)
+    .ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        ".desktop file has no valid name",
+      )
+    })?;
+  Ok((src, name))
+}
+
+/// The name an AppImage's desktop entry would be stored under, without
+/// installing anything
+pub fn desktop_entry_name(appimage: &Path) -> io::Result<String> {
+  let tmp = TempDir::new()?;
+  extract_desktop_to(appimage, &tmp).map(|(_, name)| name)
+}
+
 /// Extracts the root `.desktop` file into `dest` under its normalized name.
 /// Returns its new path.
 pub fn extract_desktop_file(
@@ -354,14 +383,7 @@ pub fn extract_desktop_file(
   before_write: BeforeWrite,
 ) -> io::Result<PathBuf> {
   let tmp = TempDir::new()?;
-  extract(appimage, &tmp.path, "*.desktop")?;
-  let src = find_in(&tmp.path.join("squashfs-root"), |n| n.ends_with(".desktop"))
-    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no .desktop file"))?;
-  let name = src
-    .file_name()
-    .and_then(|n| n.to_str())
-    .map(normalize_file_name)
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, ".desktop file has no valid name"))?;
+  let (src, name) = extract_desktop_to(appimage, &tmp)?;
   copy_out(&src, dest, &name, before_write)
 }
 
@@ -544,15 +566,24 @@ mod tests {
 
   #[test]
   fn strips_platform_and_version() {
-    assert_eq!(n("PandoraLauncher-Linux-x86_64.AppImage"), "PandoraLauncher.AppImage");
-    assert_eq!(n("audacity-linux-3.7.0-x86_64.AppImage"), "audacity.AppImage");
+    assert_eq!(
+      n("PandoraLauncher-Linux-x86_64.AppImage"),
+      "PandoraLauncher.AppImage"
+    );
+    assert_eq!(
+      n("audacity-linux-3.7.0-x86_64.AppImage"),
+      "audacity.AppImage"
+    );
     assert_eq!(n("LM-Studio-0.3.5-x86_64.AppImage"), "LM-Studio.AppImage");
     assert_eq!(n("Foo_1.2.3_amd64.AppImage"), "Foo.AppImage");
     assert_eq!(n("Foo-v2.0.1-aarch64.AppImage"), "Foo.AppImage");
     assert_eq!(n("Obsidian-1.5.3.AppImage"), "Obsidian.AppImage");
     assert_eq!(n("Foo-2024.10.15-x86-64.AppImage"), "Foo.AppImage");
     assert_eq!(n("Godot_v4.2.1-stable_linux.x86_64"), "Godot");
-    assert_eq!(n("DB-Browser-for-SQLite-v3.12.2-x86_64.AppImage"), "DB-Browser-for-SQLite.AppImage");
+    assert_eq!(
+      n("DB-Browser-for-SQLite-v3.12.2-x86_64.AppImage"),
+      "DB-Browser-for-SQLite.AppImage"
+    );
   }
 
   #[test]

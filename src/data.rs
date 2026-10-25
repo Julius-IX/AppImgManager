@@ -19,6 +19,9 @@ pub struct Application {
   /// File name inside the icons dir, `None` if the app has no icon
   #[serde(default)]
   pub icon: Option<String>,
+  /// The icon was picked by the user, so updates keep it
+  #[serde(default)]
+  pub icon_custom: bool,
   pub desktop_file: String,
   pub path: PathBuf,
   pub linked_to_desktop: bool,
@@ -105,8 +108,8 @@ impl StoredApps {
     ctx(write(), what)
   }
 
-  /// Start tracking a new app (overrides existing).
-  /// `icon` overrides the icon bundled in the AppImage
+  /// Start tracking a new app. An app whose entry name is already tracked is
+  /// refused, use `update_app` to replace it.
   pub fn add_app(
     &mut self,
     app_img: PathBuf,
@@ -114,19 +117,68 @@ impl StoredApps {
     link_to_desktop: bool,
     icon: Option<&Path>,
   ) -> Result<Application, std::io::Error> {
-    let (app, rollback) = self.setup_app(&app_img, dest, link_to_desktop, icon)?;
+    let (app, rollback) = self.install(&app_img, dest, link_to_desktop, icon)?;
 
-    let previous = self.apps.insert(app.name.clone(), app.clone());
+    self.apps.insert(app.name.clone(), app.clone());
     if let Err(e) = self.save() {
-      match previous {
-        Some(p) => self.apps.insert(p.name.clone(), p),
-        None => self.apps.remove(&app.name),
-      };
+      self.apps.remove(&app.name);
       return Err(e); // `rollback` drops here and undoes the file changes
     }
 
     rollback.commit();
     Ok(app)
+  }
+
+  /// Replace an app with a newer AppImage: finds the tracked app with the same
+  /// desktop entry name as `new_img`, removes it and adds the new one.
+  pub fn update_app(
+    &mut self,
+    new_img: PathBuf,
+    dest: Option<PathBuf>,
+    link_to_desktop: bool,
+    icon: Option<&Path>,
+  ) -> Result<Application, std::io::Error> {
+    // Needs to be executable to run `--appimage-extract`
+    ctx(
+      make_executable(&new_img),
+      format!("making {} executable", new_img.display()),
+    )?;
+    let name = ctx(
+      desktop_entry_name(&new_img),
+      format!("reading .desktop file of {}", new_img.display()),
+    )?;
+    let old = self.apps.get(&name).cloned().ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no tracked app has the entry name {name}, add it without --update"),
+      )
+    })?;
+    if same_path(&new_img, &old.path) {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is the stored AppImage itself", new_img.display()),
+      ));
+    }
+    let dest = match dest {
+      Some(dest) => dest,
+      None => old
+        .path
+        .with_file_name(normalize_file_name(&file_name_string(&new_img)?)),
+    };
+    if dest.exists() && !same_path(&dest, &old.path) {
+      return Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("destination {} already exists", dest.display()),
+      ));
+    }
+
+    self.remove_app_by_name(&name)?;
+    self.add_app(
+      new_img,
+      &dest,
+      link_to_desktop || old.linked_to_desktop,
+      icon,
+    )
   }
 
   /// True if an app is tracked at this path
@@ -142,6 +194,14 @@ impl StoredApps {
       .map(|(name, _)| name.clone())
   }
 
+  /// True if no tracked app other than `except` uses this icon file
+  fn icon_unused_by_others(&self, icon: &str, except: &str) -> bool {
+    !self
+      .apps
+      .values()
+      .any(|a| a.name != except && a.icon.as_deref() == Some(icon))
+  }
+
   /// Assign (or replace) the icon of an already tracked app
   pub fn set_icon_by_path(&mut self, path: &Path, icon: &Path) -> Result<(), std::io::Error> {
     let name = self.find_name(path).ok_or_else(|| {
@@ -150,20 +210,21 @@ impl StoredApps {
         "no tracked app found with that path",
       )
     })?;
-    let mut app = self.apps[&name].clone();
+    let old = self.apps[&name].clone();
+    let mut app = old.clone();
 
     let des_file = get_applications_dir().join(&app.desktop_file);
-    let old_desktop = ctx(
-      fs::read_to_string(&des_file),
-      format!("reading {}", des_file.display()),
-    )?;
     let stem = des_file
       .file_stem()
       .and_then(|s| s.to_str())
       .unwrap_or("app");
 
+    let mut rollback = Rollback::default();
+    rollback.track_file(&des_file)?;
     let icon_file = ctx(
-      install_icon(icon, &get_icons_dir(), stem),
+      install_icon(icon, &get_icons_dir(), stem, &mut |p| {
+        rollback.track_file(p)
+      }),
       format!("installing icon {}", icon.display()),
     )?;
     ctx(
@@ -172,30 +233,41 @@ impl StoredApps {
     )?;
 
     app.icon = Some(file_name_string(&icon_file)?);
-    let previous = self.apps.insert(name.clone(), app);
+    app.icon_custom = true;
+    self.apps.insert(name.clone(), app.clone());
     if let Err(e) = self.save() {
-      if let Some(p) = previous {
-        self.apps.insert(name, p);
+      self.apps.insert(name, old);
+      return Err(e); // `rollback` restores the desktop file and icon
+    }
+    rollback.commit();
+
+    // The previous icon may have had another extension
+    if let Some(old_icon) = &old.icon {
+      if app.icon.as_ref() != Some(old_icon) && self.icon_unused_by_others(old_icon, &name) {
+        remove_leftovers(&[get_icons_dir().join(old_icon)]);
       }
-      let _ = fs::write(&des_file, old_desktop);
-      return Err(e);
     }
     Ok(())
   }
 
-  /// Setup app to be available as a desktop entry.
-  fn setup_app(
-    &mut self,
-    app_img: &Path,
+  /// Puts an AppImage in place and makes it available as a desktop entry
+  fn install(
+    &self,
+    new_img: &Path,
     dest: &Path,
     link_to_desktop: bool,
     icon: Option<&Path>,
   ) -> Result<(Application, Rollback), std::io::Error> {
-    if dest.exists() && !same_path(app_img, dest) {
-      return Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("destination {} already exists", dest.display()),
-      ));
+    if dest.exists() && !same_path(new_img, dest) {
+      let msg = if self.is_tracked(dest) {
+        format!(
+          "{} is already tracked, use --update to replace it",
+          dest.display()
+        )
+      } else {
+        format!("destination {} already exists", dest.display())
+      };
+      return Err(io::Error::new(io::ErrorKind::AlreadyExists, msg));
     }
     if let Some(parent) = dest.parent() {
       ctx(
@@ -208,34 +280,19 @@ impl StoredApps {
 
     // Needs to be executable to run `--appimage-extract`
     ctx(
-      make_executable(app_img),
-      format!("making {} executable", app_img.display()),
+      make_executable(new_img),
+      format!("making {} executable", new_img.display()),
     )?;
 
-    let des_file = ctx(
-      extract_desktop_file(app_img, &get_applications_dir()),
-      format!("extracting .desktop file from {}", app_img.display()),
-    )?;
-    rollback.push(Undo::RemoveFile(des_file.clone()));
-    // A manually given icon wins; no icon at all is fine
-    let icon_file: Option<PathBuf> = match icon {
-      Some(src) => {
-        let stem = des_file
-          .file_stem()
-          .and_then(|s| s.to_str())
-          .unwrap_or("app");
-        Some(ctx(
-          install_icon(src, &get_icons_dir(), stem),
-          format!("installing icon {}", src.display()),
-        )?)
-      }
-      None => ctx(
-        extract_icon(app_img, &get_icons_dir()),
-        format!("extracting icon from {}", app_img.display()),
-      )?,
-    };
+    let des_file = self.extract_entry(new_img, &mut rollback)?;
+    let stem = des_file
+      .file_stem()
+      .and_then(|s| s.to_str())
+      .unwrap_or("app")
+      .to_string();
+
+    let icon_file = pick_icon(new_img, &stem, icon, &mut rollback)?;
     if let Some(icon_file) = &icon_file {
-      rollback.push(Undo::RemoveFile(icon_file.clone()));
       ctx(
         set_icon(&des_file, icon_file),
         format!("setting Icon= in {}", des_file.display()),
@@ -246,45 +303,61 @@ impl StoredApps {
       format!("setting Exec= in {}", des_file.display()),
     )?;
 
-    let mut app = Application::default();
-    app.desktop_file = file_name_string(&des_file)?;
-    app.name = app.desktop_file.clone();
-    app.icon = icon_file.as_deref().map(file_name_string).transpose()?;
-    app.path = dest.to_path_buf();
-    app.linked_to_desktop = link_to_desktop;
+    let desktop_file = file_name_string(&des_file)?;
+    let app = Application {
+      name: desktop_file.clone(),
+      desktop_file,
+      icon: icon_file.as_deref().map(file_name_string).transpose()?,
+      icon_custom: icon.is_some(),
+      path: dest.to_path_buf(),
+      linked_to_desktop: link_to_desktop,
+    };
 
-    // The only destructive step, done after everything above worked
-    if !same_path(app_img, dest) {
+    // The AppImage is moved last
+    if !same_path(new_img, dest) {
       ctx(
-        move_file(app_img, dest),
-        format!("moving {} to {}", app_img.display(), dest.display()),
+        move_file(new_img, dest),
+        format!("moving {} to {}", new_img.display(), dest.display()),
       )?;
       rollback.push(Undo::MoveBack {
         from: dest.to_path_buf(),
-        to: app_img.to_path_buf(),
+        to: new_img.to_path_buf(),
       });
     }
 
-    if link_to_desktop {
-      let desktop_app = get_desktop_dir().join(&app.name);
-      if let Some(parent) = desktop_app.parent() {
-        ctx(
-          ensure_dir(parent),
-          format!("creating directory {}", parent.display()),
-        )?;
-      }
-      ctx(
-        hard_link(&app.path, &desktop_app),
-        format!(
-          "linking {} to {}",
-          app.path.display(),
-          desktop_app.display()
-        ),
-      )?;
-      rollback.push(Undo::RemoveFile(desktop_app));
+    if app.linked_to_desktop {
+      link_on_desktop(&app, &mut rollback)?;
     }
 
     Ok((app, rollback))
+  }
+
+  /// Extracts the AppImage's .desktop file into the applications dir. Refuses
+  /// if an app with that entry name is already tracked.
+  fn extract_entry(&self, new_img: &Path, rollback: &mut Rollback) -> io::Result<PathBuf> {
+    let mut conflict: Option<String> = None;
+    let extracted = extract_desktop_file(new_img, &get_applications_dir(), &mut |target| {
+      let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+      if let Some(other) = self.apps.get(name) {
+        conflict = Some(if same_path(&other.path, new_img) {
+          format!("{} is already tracked", new_img.display())
+        } else {
+          format!(
+            "an app with the entry name {name} is already tracked at {}, use --update to replace it",
+            other.path.display()
+          )
+        });
+        return Err(io::Error::other("entry name already tracked"));
+      }
+      rollback.track_file(target)
+    });
+    match (extracted, conflict) {
+      (_, Some(msg)) => Err(io::Error::new(io::ErrorKind::AlreadyExists, msg)),
+      (r, None) => ctx(
+        r,
+        format!("extracting .desktop file from {}", new_img.display()),
+      ),
+    }
   }
 
   pub fn remove_app_by_name(&mut self, name: &str) -> Result<(), std::io::Error> {
@@ -328,12 +401,67 @@ impl StoredApps {
   }
 }
 
+/// Deletes files that are no longer needed. The new state is already saved at
+/// this point, so a failure is only reported.
+fn remove_leftovers(paths: &[PathBuf]) {
+  for p in paths {
+    if let Err(e) = remove_file(p) {
+      if e.kind() != io::ErrorKind::NotFound {
+        eprintln!("warning: could not remove {}: {e}", p.display());
+      }
+    }
+  }
+}
+
 fn file_name_string(path: &Path) -> io::Result<String> {
   path
     .file_name()
     .and_then(|n| n.to_str())
     .map(str::to_string)
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path has no valid file name"))
+}
+
+/// A manually given icon wins over the one bundled in the AppImage, having
+/// neither is fine
+fn pick_icon(
+  new_img: &Path,
+  stem: &str,
+  icon: Option<&Path>,
+  rollback: &mut Rollback,
+) -> io::Result<Option<PathBuf>> {
+  let icons_dir = get_icons_dir();
+  match icon {
+    Some(src) => ctx(
+      install_icon(src, &icons_dir, stem, &mut |p| rollback.track_file(p)),
+      format!("installing icon {}", src.display()),
+    )
+    .map(Some),
+    None => ctx(
+      extract_icon(new_img, &icons_dir, stem, &mut |p| rollback.track_file(p)),
+      format!("extracting icon from {}", new_img.display()),
+    ),
+  }
+}
+
+/// Hard-links the stored AppImage into the Desktop folder
+fn link_on_desktop(app: &Application, rollback: &mut Rollback) -> io::Result<()> {
+  let desktop_app = get_desktop_dir().join(&app.name);
+  if let Some(parent) = desktop_app.parent() {
+    ctx(
+      ensure_dir(parent),
+      format!("creating directory {}", parent.display()),
+    )?;
+  }
+  ctx(
+    hard_link(&app.path, &desktop_app),
+    format!(
+      "linking {} to {}",
+      app.path.display(),
+      desktop_app.display()
+    ),
+  )?;
+  rollback.push(Undo::RemoveFile(desktop_app));
+  Ok(())
 }
 
 /// Moves a file, falling back to copy + delete across filesystems
@@ -355,8 +483,17 @@ fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
 }
 
 enum Undo {
+  /// Delete a file this operation created
   RemoveFile(PathBuf),
-  MoveBack { from: PathBuf, to: PathBuf },
+  /// Put a file's previous contents back
+  Restore {
+    path: PathBuf,
+    bytes: Vec<u8>,
+  },
+  MoveBack {
+    from: PathBuf,
+    to: PathBuf,
+  },
 }
 
 /// Undoes recorded steps in reverse order when dropped, unless committed
@@ -370,6 +507,27 @@ impl Rollback {
     self.steps.push(undo);
   }
 
+  /// Call right before writing `path`: records how to get back what is there
+  /// now (its contents, or that it didn't exist)
+  fn track_file(&mut self, path: &Path) -> io::Result<()> {
+    match fs::read(path) {
+      Ok(bytes) => self.steps.push(Undo::Restore {
+        path: path.to_path_buf(),
+        bytes,
+      }),
+      Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        self.steps.push(Undo::RemoveFile(path.to_path_buf()))
+      }
+      Err(e) => {
+        return Err(io::Error::new(
+          e.kind(),
+          format!("backing up {}: {e}", path.display()),
+        ));
+      }
+    }
+    Ok(())
+  }
+
   fn commit(mut self) {
     self.steps.clear();
   }
@@ -378,19 +536,25 @@ impl Rollback {
 impl Drop for Rollback {
   fn drop(&mut self) {
     for step in self.steps.drain(..).rev() {
-      let result = match &step {
-        Undo::RemoveFile(p) => remove_file(p),
-        Undo::MoveBack { from, to } => move_file(from, to),
+      let (what, result) = match step {
+        Undo::RemoveFile(p) => (
+          format!("remove {}", p.display()),
+          match remove_file(&p) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+          },
+        ),
+        Undo::Restore { path, bytes } => (
+          format!("restore {}", path.display()),
+          fs::write(&path, bytes),
+        ),
+        Undo::MoveBack { from, to } => (
+          format!("move {} back to {}", from.display(), to.display()),
+          move_file(&from, &to),
+        ),
       };
       if let Err(e) = result {
-        match step {
-          Undo::RemoveFile(p) => eprintln!("rollback: could not remove {}: {e}", p.display()),
-          Undo::MoveBack { from, to } => eprintln!(
-            "rollback: could not move {} back to {}: {e}",
-            from.display(),
-            to.display()
-          ),
-        }
+        eprintln!("rollback: could not {what}: {e}");
       }
     }
   }
