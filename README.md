@@ -3,8 +3,6 @@
 A small tool for managing AppImage files on Linux.
 Track an AppImage and it gets a proper home, a menu entry and an icon, so it behaves like any other installed app.
 
----
-
 ## Installation
 
 ### Install script
@@ -40,8 +38,6 @@ sudo /usr/local/share/app-img/uninstall.sh
 ```
 
 This removes the program, not the apps you tracked with it.
-
----
 
 ## Usage
 
@@ -99,6 +95,7 @@ Passing a path opens straight on the "Track new AppImage" screen with the file f
 app-img gui ~/Downloads/Foo-1.2.3-x86_64.AppImage
 ```
 
+---
 ### Notes
 
 - Only AppImages that support `--appimage-extract` can have their entry and icon read. On some distros an AppImage won't start without FUSE 2 (`libfuse2`, or `libfuse2t64` on Ubuntu 24.04).
