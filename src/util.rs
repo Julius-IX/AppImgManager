@@ -31,6 +31,16 @@ impl Drop for TempDir {
   }
 }
 
+pub fn get_default_app_storage_dir() -> PathBuf {
+  std::env::home_dir().unwrap().join("Applications")
+}
+
+pub fn get_default_applications_dir() -> PathBuf {
+  std::env::home_dir()
+    .unwrap()
+    .join(".local/share/applications")
+}
+
 /// True if the path is a valid AppImage (Type 1 or 2)
 pub fn is_appimage(path: &Path) -> Result<bool, io::Error> {
   let mut f = File::open(path)?;
