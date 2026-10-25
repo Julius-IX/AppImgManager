@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
   collections::HashMap,
   fs::{File, OpenOptions, hard_link, remove_file, rename},
-  io::{Read, Write},
+  io::{Read, Seek, SeekFrom, Write},
   path::PathBuf,
 };
 
@@ -27,21 +27,37 @@ impl StoredApps {
     if let Some(parent) = data_path.parent() {
       std::fs::create_dir_all(parent)?;
     }
+
     let mut data_file = OpenOptions::new()
       .read(true)
       .write(true)
       .create(true)
       .truncate(false)
-      .open(data_path)?;
+      .open(&data_path)?;
+
+    if data_file.metadata()?.len() == 0 {
+      data_file.write_all(b"[]")?;
+      data_file.seek(SeekFrom::Start(0))?;
+    }
 
     let mut data = String::new();
     data_file.read_to_string(&mut data)?;
 
-    let data: Vec<Application> = serde_json::from_str(&data)?;
-    let mut apps = HashMap::new();
-    for app in data {
-      apps.insert(app.name.clone(), app);
-    }
+    let data: Vec<Application> = serde_json::from_str(&data).map_err(|e| {
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+          "Data file {} is corrupt or in an unsupported format and cannot be used: {e}",
+          data_path.display()
+        ),
+      )
+    })?;
+
+    let apps = data
+      .into_iter()
+      .map(|app| (app.name.clone(), app))
+      .collect();
+
     Ok(Self { apps, data_file })
   }
 
