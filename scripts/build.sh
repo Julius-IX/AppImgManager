@@ -18,8 +18,8 @@ bin="${BIN:-$(sed -n 's/^name *= *"\(.*\)"/\1/p' Cargo.toml | head -1)}"
 
 # rust target -> release asset name (must match install.sh: $name-$arch-linux)
 targets=(
-  "x86_64-unknown-linux-musl:$name-x86_64-linux"
-  "aarch64-unknown-linux-musl:$name-aarch64-linux"
+  "x86_64-unknown-linux-gnu:$name-x86_64-linux"
+  "aarch64-unknown-linux-gnu:$name-aarch64-linux"
 )
 
 host_arch=$(uname -m)
