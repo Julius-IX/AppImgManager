@@ -4,15 +4,17 @@ use std::process::ExitCode;
 pub const DEFAULT_DESTINATION: &str = "~/Applications/";
 
 #[derive(Parser)]
-#[command(author, version)]
+#[command(author, version, about = "A tool to manage AppImages")]
 struct ArgParser {
   #[command(subcommand)]
   run_type: RunType,
 }
 
 #[derive(Subcommand)]
-enum RunType {
+pub enum RunType {
+  /// Run actions directly
   Cli(super::cli::CliArgs),
+  /// Open the GUI
   Gui(super::gui::GuiArgs),
 }
 

@@ -12,9 +12,11 @@ pub struct CliArgs {
   #[arg(long = "clean", short = 'c', default_value = "false")]
   clean: bool,
 
+  /// Where to put the AppImage file
   #[arg(long="destination", short='d', default_value=super::arg_parsing::DEFAULT_DESTINATION)]
   destination_path: Option<PathBuf>,
 
+  /// If a hard link should be created in the Desktop folder
   #[arg(long = "link", short = 'l', default_value = "false")]
   link_to_desktop: bool,
 }
