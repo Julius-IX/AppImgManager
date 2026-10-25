@@ -1,3 +1,4 @@
+mod app_ui;
 mod arg_parsing;
 mod cli;
 mod gui;

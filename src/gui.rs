@@ -1,6 +1,5 @@
 use clap::Args;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Args)]
 pub struct GuiArgs {
@@ -10,5 +9,9 @@ pub struct GuiArgs {
 }
 
 pub fn run(args: GuiArgs) -> ExitCode {
-  todo!()
+  if let Err(e) = super::app_ui::run(args) {
+    eprintln!("error: {}", e); // TODO: handle
+    return ExitCode::FAILURE;
+  }
+  ExitCode::SUCCESS
 }
