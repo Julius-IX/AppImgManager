@@ -2,8 +2,8 @@ use crate::util::*;
 use serde::{Deserialize, Serialize};
 use std::{
   collections::HashMap,
-  fs::{File, hard_link, remove_file, rename},
-  io::Write,
+  fs::{File, OpenOptions, hard_link, remove_file, rename},
+  io::{Read, Write},
   path::PathBuf,
 };
 
@@ -22,6 +22,29 @@ pub struct Application {
 }
 
 impl StoredApps {
+  pub fn new() -> Result<Self, std::io::Error> {
+    let data_path = super::util::get_data_dir().join("apps.json");
+    if let Some(parent) = data_path.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
+    let mut data_file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(false)
+      .open(data_path)?;
+
+    let mut data = String::new();
+    data_file.read_to_string(&mut data)?;
+
+    let data: Vec<Application> = serde_json::from_str(&data)?;
+    let mut apps = HashMap::new();
+    for app in data {
+      apps.insert(app.name.clone(), app);
+    }
+    Ok(Self { apps, data_file })
+  }
+
   /// Write current tracked apps to data file
   pub fn save(&mut self) -> Result<(), std::io::Error> {
     let data = serde_json::to_string(&self.apps)?;
