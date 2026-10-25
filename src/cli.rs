@@ -43,7 +43,7 @@ pub fn run(args: CliArgs) -> ExitCode {
   };
 
   // Stored under a name without platform or version info
-  let file_name = super::util::normalize_file_name(
+  let file_name = super::file_name::normalize_file_name(
     args
       .app_img_path
       .file_name()
@@ -85,7 +85,7 @@ pub fn run(args: CliArgs) -> ExitCode {
       return ExitCode::FAILURE;
     }
   } else {
-    let dest = dest.unwrap_or_else(|| super::util::get_default_app_storage_dir().join(&file_name));
+    let dest = dest.unwrap_or_else(|| super::paths::get_default_app_storage_dir().join(&file_name));
     match stored_apps.add_app(
       args.app_img_path.clone(),
       &dest,
@@ -132,7 +132,7 @@ fn verify_args(args: &CliArgs) -> bool {
     }
   }
 
-  match super::util::is_appimage(&args.app_img_path) {
+  match super::app_image::is_appimage(&args.app_img_path) {
     Err(e) => {
       eprintln!("error: {e}");
       is_valid = false;

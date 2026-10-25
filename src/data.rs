@@ -1,4 +1,11 @@
-use crate::util::*;
+use crate::{
+  app_image::{desktop_entry_name, extract_desktop_file, extract_icon},
+  desktop_files::{DesktopEntry, set_exec, set_icon},
+  file_name::normalize_file_name,
+  fs_util::{ctx, make_executable},
+  icons::install_icon,
+  paths::{ensure_dir, get_applications_dir, get_desktop_dir, get_icons_dir, same_path},
+};
 use serde::{Deserialize, Serialize};
 use std::{
   collections::HashMap,
@@ -29,7 +36,7 @@ pub struct Application {
 
 impl StoredApps {
   pub fn new() -> Result<Self, std::io::Error> {
-    let data_path = super::util::get_data_dir().join("apps.json");
+    let data_path = super::paths::get_data_dir().join("apps.json");
     if let Some(parent) = data_path.parent() {
       ctx(
         ensure_dir(parent),
