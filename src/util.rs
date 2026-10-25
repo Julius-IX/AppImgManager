@@ -31,6 +31,46 @@ impl Drop for TempDir {
   }
 }
 
+/// Adds what was being done to an io error, keeping its kind
+pub fn ctx<T>(r: io::Result<T>, what: impl std::fmt::Display) -> io::Result<T> {
+  r.map_err(|e| io::Error::new(e.kind(), format!("{what}: {e}")))
+}
+
+/// Like `create_dir_all`, but copes with what is already there:
+/// an existing dir or a symlink to one is fine, and a dangling symlink gets
+/// its target created. Only a non-directory in the way is an error.
+pub fn ensure_dir(path: &Path) -> io::Result<()> {
+  ensure_dir_depth(path, 0)
+}
+
+fn ensure_dir_depth(path: &Path, depth: u8) -> io::Result<()> {
+  if path.is_dir() {
+    return Ok(());
+  }
+  match fs::symlink_metadata(path) {
+    Ok(meta) if meta.file_type().is_symlink() => {
+      if depth >= 16 {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidInput,
+          format!("{} is a symlink loop", path.display()),
+        ));
+      }
+      let target = fs::read_link(path)?;
+      let target = if target.is_absolute() {
+        target
+      } else {
+        path.parent().unwrap_or(Path::new(".")).join(target)
+      };
+      ensure_dir_depth(&target, depth + 1)
+    }
+    Ok(_) => Err(io::Error::new(
+      io::ErrorKind::AlreadyExists,
+      format!("{} exists but is not a directory", path.display()),
+    )),
+    Err(_) => fs::create_dir_all(path),
+  }
+}
+
 pub fn get_default_app_storage_dir() -> PathBuf {
   std::env::home_dir().unwrap().join("Applications")
 }
@@ -93,20 +133,29 @@ pub fn make_executable(path: &Path) -> io::Result<()> {
 
 /// Extracts files matching `pattern` into `work/squashfs-root`
 fn extract(appimage: &Path, work: &Path, pattern: &str) -> io::Result<()> {
-  let appimage = appimage.canonicalize()?;
-  let status = Command::new(&appimage)
-    .arg("--appimage-extract")
-    .arg(pattern)
-    .current_dir(work)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status()?;
+  let appimage = ctx(
+    appimage.canonicalize(),
+    format!("resolving {}", appimage.display()),
+  )?;
+  let status = ctx(
+    Command::new(&appimage)
+      .arg("--appimage-extract")
+      .arg(pattern)
+      .current_dir(work)
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status(),
+    format!("running {} --appimage-extract", appimage.display()),
+  )?;
   if status.success() {
     Ok(())
   } else {
     Err(io::Error::new(
       io::ErrorKind::NotFound,
-      format!("nothing matched {pattern}"),
+      format!(
+        "{} --appimage-extract {pattern} failed ({status})",
+        appimage.display()
+      ),
     ))
   }
 }
@@ -122,12 +171,16 @@ fn find_in(dir: &Path, pick: impl Fn(&str) -> bool) -> Option<PathBuf> {
 
 /// Copies contents (not permissions) into `dest`, so the result is always writable
 fn copy_out(src: &Path, dest: &Path) -> io::Result<PathBuf> {
-  fs::create_dir_all(dest)?;
+  ctx(
+    ensure_dir(dest),
+    format!("creating directory {}", dest.display()),
+  )?;
   let name = src
     .file_name()
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
   let out = dest.join(name);
-  fs::write(&out, fs::read(src)?)?;
+  let bytes = ctx(fs::read(src), format!("reading {}", src.display()))?;
+  ctx(fs::write(&out, bytes), format!("writing {}", out.display()))?;
   Ok(out)
 }
 
@@ -140,8 +193,9 @@ pub fn extract_desktop_file(appimage: &Path, dest: &Path) -> io::Result<PathBuf>
   copy_out(&src, dest)
 }
 
-/// Extracts the icon (png, svg, xpm, or .DirIcon) into `dest`. Returns its new path.
-pub fn extract_icon(appimage: &Path, dest: &Path) -> io::Result<PathBuf> {
+/// Extracts the icon (png, svg, xpm, or .DirIcon) into `dest`. Returns its new
+/// path, or `None` if the AppImage doesn't contain one (that is not an error).
+pub fn extract_icon(appimage: &Path, dest: &Path) -> io::Result<Option<PathBuf>> {
   let tmp = TempDir::new()?;
   let root = tmp.path.join("squashfs-root");
   for pattern in ["*.png", "*.svg", "*.xpm", ".DirIcon"] {
@@ -150,11 +204,31 @@ pub fn extract_icon(appimage: &Path, dest: &Path) -> io::Result<PathBuf> {
         n == ".DirIcon" || [".png", ".svg", ".xpm"].iter().any(|e| n.ends_with(e))
       });
       if let Some(src) = hit {
-        return copy_out(&src, dest);
+        return copy_out(&src, dest).map(Some);
       }
     }
   }
-  Err(io::Error::new(io::ErrorKind::NotFound, "no icon found"))
+  Ok(None)
+}
+
+/// Copies a user supplied icon into `dest` as `<stem>.<ext>`, so a generic
+/// name like `icon.png` can't collide with another app's icon.
+pub fn install_icon(src: &Path, dest: &Path, stem: &str) -> io::Result<PathBuf> {
+  if !src.is_file() {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!("{} is not a file", src.display()),
+    ));
+  }
+  ctx(
+    ensure_dir(dest),
+    format!("creating directory {}", dest.display()),
+  )?;
+  let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+  let out = dest.join(format!("{stem}.{ext}"));
+  let bytes = ctx(fs::read(src), format!("reading {}", src.display()))?;
+  ctx(fs::write(&out, bytes), format!("writing {}", out.display()))?;
+  Ok(out)
 }
 
 /// Rewrites a desktop file line by line. `edit` gets (is_in_main_group, line
@@ -191,13 +265,43 @@ fn rewrite(
   Ok(())
 }
 
-/// Sets `Icon=` in the main [Desktop Entry] group to `icon`.
-/// Idempotent.
+/// Sets `Icon=` in the main [Desktop Entry] group to `icon`. Idempotent.
+/// Adds the line if the desktop file doesn't have one yet.
 pub fn set_icon(desktop_file: &Path, icon: &Path) -> io::Result<()> {
   let icon = icon.to_string_lossy();
+  let mut found = false;
   rewrite(desktop_file, |main, line| {
-    (main && line.starts_with("Icon=")).then(|| format!("Icon={icon}"))
-  })
+    if main && line.starts_with("Icon=") {
+      found = true;
+      Some(format!("Icon={icon}"))
+    } else {
+      None
+    }
+  })?;
+  if found {
+    return Ok(());
+  }
+
+  let text = fs::read_to_string(desktop_file)?;
+  let mut out = String::with_capacity(text.len() + icon.len() + 8);
+  let mut inserted = false;
+  for raw in text.split_inclusive('\n') {
+    out.push_str(raw);
+    if !inserted && raw.trim() == "[Desktop Entry]" {
+      if !raw.ends_with('\n') {
+        out.push('\n');
+      }
+      out.push_str(&format!("Icon={icon}\n"));
+      inserted = true;
+    }
+  }
+  if !inserted {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      "no [Desktop Entry] group",
+    ));
+  }
+  fs::write(desktop_file, out)
 }
 
 /// Points every `Exec=` line (including [Desktop Action] groups) at `exec`,
