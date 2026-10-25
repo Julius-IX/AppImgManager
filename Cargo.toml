@@ -7,3 +7,4 @@ edition = "2024"
 clap = { version = "4.6.7", features = ["derive"] }
 eframe = "0.37.0"
 json-serde = "0.0.1-alpha.3"
+serde = "1.0.229"

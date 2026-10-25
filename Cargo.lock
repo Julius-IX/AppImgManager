@@ -242,6 +242,7 @@ dependencies = [
  "clap",
  "eframe",
  "json-serde",
+ "serde",
 ]
 
 [[package]]
