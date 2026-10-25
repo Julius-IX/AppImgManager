@@ -1,3 +1,4 @@
+mod util;
 mod arg_parsing;
 mod cli;
 mod gui;
