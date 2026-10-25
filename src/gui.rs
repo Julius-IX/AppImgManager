@@ -3,9 +3,10 @@ use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Args)]
 pub struct GuiArgs {
-  /// Path to AppImage file to perform operations on
+  /// AppImage to track. If given, the GUI opens on the "track new AppImage"
+  /// screen with this path filled in, otherwise it opens on the home screen
   #[arg()]
-  app_img_path: PathBuf,
+  pub app_img_path: Option<PathBuf>,
 }
 
 pub fn run(args: GuiArgs) -> ExitCode {
