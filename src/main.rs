@@ -1,7 +1,8 @@
-mod util;
 mod arg_parsing;
 mod cli;
 mod gui;
+mod data;
+mod util;
 
 use std::process::ExitCode;
 

@@ -14,7 +14,7 @@ struct TempDir {
 }
 
 impl TempDir {
-  fn new() -> io::Result<Self> {
+  pub fn new() -> io::Result<Self> {
     let nanos = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .map(|d| d.as_nanos())
@@ -35,10 +35,29 @@ pub fn get_default_app_storage_dir() -> PathBuf {
   std::env::home_dir().unwrap().join("Applications")
 }
 
-pub fn get_default_applications_dir() -> PathBuf {
+pub fn get_icons_dir() -> PathBuf {
+  std::env::home_dir().unwrap().join(".local/share/icons")
+}
+
+pub fn get_applications_dir() -> PathBuf {
   std::env::home_dir()
     .unwrap()
     .join(".local/share/applications")
+}
+
+pub fn get_data_dir() -> PathBuf {
+  std::env::home_dir().unwrap().join(".local/share/app-img")
+}
+
+pub fn get_desktop_dir() -> PathBuf {
+  std::env::home_dir().unwrap().join("Desktop")
+}
+
+pub fn same_path(a: &Path, b: &Path) -> bool {
+  match (a.canonicalize(), b.canonicalize()) {
+    (Ok(a), Ok(b)) => a == b,
+    _ => a == b,
+  }
 }
 
 /// True if the path is a valid AppImage (Type 1 or 2)
