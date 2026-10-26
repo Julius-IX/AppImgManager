@@ -57,7 +57,7 @@ main() {
 Type=Application
 Name=AppImage Manager
 Comment=Manage AppImages
-Exec=/usr/local/bin/$name %f
+Exec=/usr/local/bin/$name gui %f
 Icon=$icon_path
 Terminal=false
 MimeType=application/vnd.appimage;application/x-iso9660-appimage;
